@@ -80,6 +80,9 @@ func (d *DB) Vacuum(requested uint64) (versions.VacuumResult, error) {
 		return versions.VacuumResult{}, fault("invalid", "vacuum horizon outside retained interval")
 	}
 	horizon := requested
+	// Every retained session pins retention at its read basis, including
+	// salvaged sessions: the old views a caller is correcting against must not
+	// be reclaimed before the session is explicitly rebased or rolled back.
 	for _, tx := range d.transactions {
 		if tx.Snapshot < horizon {
 			horizon = tx.Snapshot

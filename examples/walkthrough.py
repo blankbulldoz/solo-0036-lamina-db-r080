@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded production walkthroughs using only the public HTTP service."""
 import argparse, concurrent.futures, json, os, pathlib, shutil, socket, subprocess, tempfile, time, urllib.request, urllib.error
-WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics']
+WORKFLOWS=['catalog-create','txn-write','snapshot-read','index-build','query-plan','sql-execute','txn-conflict','restart','checkpoint','backup-restore','changes','vacuum','transaction-close','statistics','salvage-conflict']
 class Session:
  def __init__(self,binary,root,restore=None):
   self.binary=str(binary);self.root=pathlib.Path(root);self.restore=restore;self.process=None;self.log=None
@@ -33,9 +33,19 @@ class Session:
   except urllib.error.HTTPError as e:code=e.code;body=e.read()
   if code!=status:raise RuntimeError(f'{method} {path}: expected {status}, got {code}: {body.decode()}')
   return body if raw else json.loads(body)
+ def request(self,method,path,data=None):
+  encoded=None if data is None else json.dumps(data,ensure_ascii=False).encode()
+  req=urllib.request.Request(self.url+path,data=encoded,method=method,headers={'Content-Type':'application/json'})
+  try:
+   with urllib.request.urlopen(req,timeout=12) as response:return response.status,json.loads(response.read())
+  except urllib.error.HTTPError as e:return e.code,json.loads(e.read())
  def begin(self,readonly=False):return self.call('POST','/transactions',{'read_only':readonly},201)['id']
  def put(self,tx,row,status=200,insert=False):return self.call('POST',f'/transactions/{tx}/put',{'relation':'spectra','row':row,'insert_only':insert},status)
- def commit(self,tx,status=200):return self.call('POST',f'/transactions/{tx}/commit',status=status)
+ def commit(self,tx,status=200,**policy):return self.call('POST',f'/transactions/{tx}/commit',policy or None,status)
+ def rebase(self,tx):return self.call('POST',f'/transactions/{tx}/rebase',{})
+ def confirm(self,tx,key,seq,status=200):return self.call('POST',f'/transactions/{tx}/confirm',{'relation':'spectra','key':key,'observed_sequence':seq},status)
+ def inspect(self,tx,status=200):return self.call('GET',f'/transactions/{tx}',None,status)
+ def vacuum(self,horizon):return self.call('POST','/vacuum',{'horizon':horizon})
  def query(self,**kwargs):return self.call('POST','/query',{'relation':'spectra',**kwargs})
  def stats(self):return self.call('GET','/stats')
 def require(condition,message):
@@ -152,6 +162,57 @@ def walkthrough(name,binary):
     q=s.query(where=[{'column':'amplitude','op':'>=','value':40}],limit=2)
     require(q['matched']==3 and q['scanned']==3 and len(q['rows'])==2 and q['truncated'],'query fact meanings conflated')
     observations={'query':q,'stats':s.stats()}
+   elif name=='salvage-conflict':
+    s.call('POST','/indexes',{'name':'by_band','relation':'spectra','column':'band','unique':True},201)
+    # same-key first-committer-wins with salvage elected on the loser
+    a=s.begin();winner=s.begin()
+    s.put(a,tuple_(1,amplitude=101));s.put(a,tuple_(8));s.put(winner,tuple_(1,amplitude=202));s.commit(winner)
+    head_before_fail=s.stats()['sequence']
+    code,failed=s.request('POST',f'/transactions/{a}/commit',{'on_conflict':'salvage'});require(code==409,'salvage conflict not 409')
+    require(failed['error']['code']=='write_conflict','same-key failure must be write_conflict')
+    report=failed['salvage'];stale=[e for e in report['edits'] if e['key']=='int:1'][0];clean=[e for e in report['edits'] if e['key']=='int:8'][0]
+    require(report['state']=='salvaged' and report['retained_edits']==2,'write set not retained')
+    require(stale['write_stale'] and not clean['write_stale'] and report['blocked'],'per-edit invalidation basis wrong')
+    require(s.stats()['sequence']==head_before_fail,'validation failure consumed a sequence')
+    # retained context still pins versions and keeps repeatable reads; no silent refresh
+    require(s.query(transaction=a,where=[{'column':'sample','op':'=','value':1}])['rows'][0]['amplitude']==101,'salvaged read silently refreshed')
+    s.put(a,tuple_(9),409);s.commit(a,409,on_conflict='salvage')
+    rebased=s.rebase(a);require(rebased['state']=='active' and rebased['snapshot']==report['snapshot'],'rebase must keep the read basis, not silently advance it')
+    require(rebased['head']==s.stats()['sequence'],'rebase report must still classify against the current head')
+    require(rebased['write_stale_edits']==1,'rebase silently cleared a stale flag')
+    # the retained read basis is unchanged: the session still sees its own edit,
+    # while an explicit current read exposes the committed winner it must inspect
+    require(s.query(transaction=a,where=[{'column':'sample','op':'=','value':1}])['rows'][0]['amplitude']==101,'rebase silently refreshed a transactional read')
+    require(s.query(where=[{'column':'sample','op':'=','value':1}])['rows'][0]['amplitude']==202,'current read must expose the committed winner for explicit inspection')
+    head=s.stats()['sequence']
+    s.confirm(a,'int:1',head-1,409)
+    confirmed=s.confirm(a,'int:1',head);require(not confirmed['blocked'],'observed confirmation did not clear write-stale edit')
+    # a later racing commit makes the next attempt fail closed: salvage is not an infinite retry
+    racer=s.begin();s.put(racer,tuple_(1,amplitude=303));s.commit(racer)
+    s.commit(a,409,on_conflict='salvage');s.inspect(a,404)
+    # unique-value contention is a distinct, non-confirmable failure kind
+    u=s.begin();s.put(u,tuple_(9,band='b2'))
+    ucode,uerr=s.request('POST',f'/transactions/{u}/commit',{'on_conflict':'salvage'});require(ucode==409,'unique conflict not 409')
+    require(uerr['error']['code']=='unique_conflict' and uerr['salvage']['edits'][0]['unique_stale'],'unique contention misclassified')
+    s.rebase(u);s.confirm(u,'int:9',s.stats()['sequence'],409)
+    s.put(u,tuple_(9,band='b9'));require(not s.inspect(u)['blocked'],'restaged unique edit still blocked');s.commit(u)
+    # default fail-closed client semantics: no body or explicit abort discards everything
+    old=s.begin();other_tx=s.begin();s.put(old,tuple_(2,amplitude=222));s.put(other_tx,tuple_(2,amplitude=333));s.commit(other_tx)
+    acode,aborted=s.request('POST',f'/transactions/{old}/commit',None);require(acode==409,'abort conflict not 409')
+    require('salvage' not in aborted,'old client no longer fails closed');s.inspect(old,404)
+    # retained edit basis and vacuum share one retention boundary; rollback releases it
+    pin=s.begin();rival=s.begin();s.put(pin,tuple_(1,amplitude=777));s.put(rival,tuple_(1,amplitude=888));s.commit(rival)
+    pcode,pinfail=s.request('POST',f'/transactions/{pin}/commit',{'on_conflict':'salvage'});require(pcode==409,'pin conflict not 409')
+    pin_snap=pinfail['salvage']['snapshot'];pinned=s.vacuum(s.stats()['sequence'])
+    require(pinned['pinned'] and pinned['horizon']==pin_snap and s.stats()['retention_pin_sequence']==pin_snap,'salvaged basis did not protect versions')
+    s.call('POST',f'/transactions/{pin}/rollback');reclaimed=s.vacuum(s.stats()['sequence'])
+    require(not reclaimed['pinned'],'releasing salvage did not free retention')
+    # restart closes the in-memory salvage boundary; only durable commits survive
+    rtx=s.begin();r2=s.begin();s.put(rtx,tuple_(3,amplitude=444));s.put(r2,tuple_(3,amplitude=555));s.commit(r2);rcode,_=s.request('POST',f'/transactions/{rtx}/commit',{'on_conflict':'salvage'});require(rcode==409,'restart conflict not 409')
+    s.stop();s.start()
+    require(s.stats()['salvaged_sessions']==0,'salvage context survived a restart');s.inspect(rtx,404)
+    require(s.query(where=[{'column':'sample','op':'=','value':3}])['rows'][0]['amplitude']==555,'committed winner lost on restart')
+    observations={'conflict_kind':'write_conflict vs unique_conflict','retained':report,'rebase':rebased,'vacuum_pin':pin_snap,'restart':'salvage dropped, durable data kept'}
    else:raise ValueError(name)
    return {'workflow':name,'status':'observed','observations':observations}
   finally:

@@ -348,6 +348,24 @@
       "verification": "python3 examples/walkthrough.py --workflow transaction-close"
     },
     {
+      "id": "salvage-conflict",
+      "name": "conflict salvage with explicit invalidation boundaries",
+      "entry": "POST /transactions/{tx}/commit on_conflict=salvage, /rebase, /confirm",
+      "steps": [
+        "transport",
+        "engine",
+        "versions"
+      ],
+      "module_ids": [
+        "transport",
+        "engine",
+        "versions"
+      ],
+      "success": "retained private write set is classified per edit and corrected edits commit atomically",
+      "failure": "abort fails closed; write, unique and durable-uncertain failures stay distinct; retained basis pins vacuum and is dropped on restart",
+      "verification": "python3 examples/walkthrough.py --workflow salvage-conflict"
+    },
+    {
       "id": "statistics",
       "name": "query execution facts and database resource state",
       "entry": "GET /stats and POST /query",

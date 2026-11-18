@@ -51,7 +51,10 @@ func write(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_, _ = w.Write(b)
 }
-func respondError(w http.ResponseWriter, err error) {
+
+// respondErrorWith attaches an extra structured field (used for salvage
+// reports) to the standard error envelope without changing its shape.
+func respondErrorWith(w http.ResponseWriter, err error, extra map[string]any) {
 	status := http.StatusInternalServerError
 	code := "internal"
 	var domain *engine.Error
@@ -62,7 +65,7 @@ func respondError(w http.ResponseWriter, err error) {
 			status = 400
 		case "not_found":
 			status = 404
-		case "conflict":
+		case "conflict", "write_conflict", "unique_conflict", "salvage_state":
 			status = 409
 		case "snapshot":
 			status = 410
@@ -77,7 +80,14 @@ func respondError(w http.ResponseWriter, err error) {
 		slog.Error("request failed", "error", err)
 		message = "internal database error"
 	}
-	write(w, status, map[string]any{"error": map[string]string{"code": code, "message": message}})
+	payload := map[string]any{"error": map[string]string{"code": code, "message": message}}
+	for k, v := range extra {
+		payload[k] = v
+	}
+	write(w, status, payload)
+}
+func respondError(w http.ResponseWriter, err error) {
+	respondErrorWith(w, err, nil)
 }
 func (s *Server) routes() {
 	const p = "/v1/lamina"
@@ -86,10 +96,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST "+p+"/relations", s.createRelation)
 	s.mux.HandleFunc("POST "+p+"/indexes", s.createIndex)
 	s.mux.HandleFunc("POST "+p+"/transactions", s.begin)
+	s.mux.HandleFunc("GET "+p+"/transactions/{tx}", s.inspectTx)
 	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/put", s.put)
 	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/delete", s.deleteRow)
 	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/commit", s.commit)
 	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/rollback", s.rollback)
+	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/rebase", s.rebase)
+	s.mux.HandleFunc("POST "+p+"/transactions/{tx}/confirm", s.confirmEdit)
 	s.mux.HandleFunc("POST "+p+"/get", s.get)
 	s.mux.HandleFunc("POST "+p+"/query", s.query)
 	s.mux.HandleFunc("POST "+p+"/sql", s.sql)

@@ -50,7 +50,20 @@ curl -s http://127.0.0.1:7386/v1/lamina/sql -H 'Content-Type: application/json' 
 
 读事务固定开始时的提交序号，重复读稳定，支持读自己的暂存写入。普通读使用当前序号。按 `at` 查询只接受保留区间内的序号，并要求关系在该序号已存在。事务无法访问在它开始之后创建的关系。无显式排序时按类型化主键排序；排序相同时也用主键确定次序。升序 null 在前，降序 null 在后。null 普通比较不匹配；使用 `is_null` 检查。
 
-数据库提供快照隔离和同键 first-committer-wins，不承诺串行化、谓词锁或跨行写偏差防护。提交前对最终可见状态检查所有受影响关系的唯一索引；一次事务内可以置换唯一值。失败提交会关闭该事务，不发布任何私有行。只读事务通过 `{"read_only":true}` 开始。
+数据库提供快照隔离和同键 first-committer-wins，不承诺串行化、谓词锁或跨行写偏差防护。提交前对最终可见状态检查所有受影响关系的唯一索引；一次事务内可以置换唯一值。
+
+### 冲突后的编辑保留与显式失效边界
+
+普通提交（不带正文或 `{"on_conflict":"abort"}`）保持失败关闭：校验失败即关闭事务、不发布任何私有行，旧客户端行为完全不变。需要保留已暂存编辑继续纠正时，提交可声明 `{"on_conflict":"salvage"}`。校验失败返回 409，并在标准错误信封外附带 `salvage` 报告，事务进入 `salvaged` 状态，私有写集一行不丢：
+
+- 失败按家族区分，绝不混成一种可重试状态：同键 first-committer-wins 为 `write_conflict`，唯一索引最终状态争用为 `unique_conflict`，耐久写入结果不确定仍为 503 `unavailable`（实例中毒、必须重启核验，**不提供保留**）。
+- 报告对每个编辑独立给出 `basis`、`write_stale`、`unique_stale`、`requires_confirmation` 与原因，可提交与必须重新确认的编辑分开计数。
+- `salvaged` 会话拒绝新的 `put/delete` 和 `commit`，但仍按原快照重复读并叠加自己的私有写入；`rebase` 只重新分类并恢复可编辑状态，**不推进读快照**，因此不会把调用方没看过的最新数据悄悄替换进它的读取依据。
+- 想看新提交的数据必须发起一次普通（当前）读；确认覆盖用 `POST /transactions/<id>/confirm`，正文 `{"relation","key","observed_sequence"}` 中的序号必须等于当前 head，否则拒绝——不接受盲确认。同键陈旧可在看过 head 后显式确认；`unique_conflict` 无法被确认掉，只能用 `put` 重新暂存该键使最终状态合法。
+- 保留只在一个失效边界内有效：`rebase` 之后再次提交若仍冲突，恢复失败关闭（不会无限自动保留/重试）；回放或重启后内存中的保留会话消失，只有耐久提交的数据仍在，旧事务 ID 返回 404。
+- 保留的编辑依据与真空回收共用同一水位：`salvaged`（及活动）事务的读快照会挡住 `vacuum`，旧视图在会话被 `rebase`/`rollback`/关闭前不会被回收；`GET /stats` 的 `retention_pin_sequence`、`salvaged_sessions`、`salvaged_edits` 暴露这份占用，便于在“保留上下文继续改”和“立即释放给其他写入”之间做显式取舍。
+
+失败提交会关闭该事务，不发布任何私有行。只读事务通过 `{"read_only":true}` 开始。
 
 SQL 只支持单条 SELECT：投影或 `count(*)`、`count(column)`、`sum(integer_column)`，可选 WHERE AND、ORDER BY、LIMIT。字符串使用单引号，内部单引号写两次；关键字及未引号标识符转为小写。没有 JOIN、GROUP BY、别名、表达式、SQL DDL/DML。语义检查与结构化查询共用绑定和执行。`sum` 忽略 null，空输入返回 null，溢出报错；`count(column)` 忽略 null，`count(*)` 计算全部匹配行。
 
@@ -91,7 +104,7 @@ curl -s http://127.0.0.1:7386/v1/lamina/backup -o /tmp/lamina-backup.lmi
 
 请求体上限 1MiB，列数 64，文本值 64KiB，活动事务 128，每事务最终写集 1000 个键，单日志帧 16MiB，镜像 128MiB。查询最多 32 个 AND 谓词、8 个排序项，默认输出 1000 行，可显式设到 10000；截断时 `truncated=true`。查询执行仍可能物化全部匹配行，事务没有自动过期，排序和备份没有外溢机制，应显式关闭不用的会话并为演练设置合理数据规模。
 
-错误 JSON 为 `{"error":{"code":"...","message":"..."}}`。无效输入 400，已关闭或未知事务及缺失行 404，写冲突或唯一冲突 409，快照和变更历史不可用 410，容量拒绝 429，存储不确定或已关闭 503。`GET /stats` 返回会话、版本、候选索引大小、恢复尾字节等领域事实，进程计数在重启后归零。
+错误 JSON 为 `{"error":{"code":"...","message":"..."}}`。无效输入 400，已关闭或未知事务及缺失行 404，写冲突或唯一冲突 409，快照和变更历史不可用 410，容量拒绝 429，存储不确定或已关闭 503。409 的 `code` 进一步区分 `write_conflict`（同键先提交者胜）、`unique_conflict`（唯一值争用，不能靠确认消除）和通用 `conflict`（如对 `salvaged` 会话的非法操作）；带 `on_conflict=salvage` 的提交在 409 时额外携带 `salvage` 报告。保留生命周期接口为 `GET /transactions/<id>`（查看逐编辑分类）、`POST /transactions/<id>/rebase`（重新分类并恢复可编辑，不推进读快照）和 `POST /transactions/<id>/confirm`（基于已观测 head 显式接受一个同键陈旧编辑）。`GET /stats` 返回会话、版本、候选索引大小、恢复尾字节等领域事实，进程计数在重启后归零。
 
 ## 容器
 

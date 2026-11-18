@@ -6,6 +6,9 @@ type Stats struct {
 	Sequence       uint64         `json:"sequence"`
 	Horizon        uint64         `json:"horizon"`
 	Active         []Transaction  `json:"active"`
+	Salvaged       int            `json:"salvaged_sessions"`
+	SalvagedEdits  int            `json:"salvaged_edits"`
+	PinnedByEdit   uint64         `json:"retention_pin_sequence"`
 	Keys           int            `json:"keys"`
 	Versions       int            `json:"versions"`
 	IndexEntries   map[string]int `json:"index_entries"`
@@ -24,11 +27,20 @@ func (d *DB) Stats() (Stats, error) {
 		return Stats{}, err
 	}
 	keys, versions := d.store.Count()
-	s := Stats{Sequence: d.sequence, Horizon: d.horizon, Keys: keys, Versions: versions, Active: []Transaction{}, IndexEntries: map[string]int{}, JournalRecords: len(d.wal.Records), HistoryBase: d.wal.Base, RecoveredTail: d.wal.RecoveredTail, Commits: d.commits, Conflicts: d.conflicts, Queries: d.queries}
+	s := Stats{Sequence: d.sequence, Horizon: d.horizon, Keys: keys, Versions: versions, Active: []Transaction{}, IndexEntries: map[string]int{}, JournalRecords: len(d.wal.Records), HistoryBase: d.wal.Base, RecoveredTail: d.wal.RecoveredTail, Commits: d.commits, Conflicts: d.conflicts, Queries: d.queries, PinnedByEdit: d.sequence}
 	for _, tx := range d.transactions {
 		copy := *tx
 		copy.writes = nil
 		s.Active = append(s.Active, copy)
+		if tx.State == stateSalvaged {
+			s.Salvaged++
+			for _, mutations := range tx.writes {
+				s.SalvagedEdits += len(mutations)
+			}
+		}
+		if tx.Snapshot < s.PinnedByEdit {
+			s.PinnedByEdit = tx.Snapshot
+		}
 	}
 	sort.Slice(s.Active, func(i, j int) bool { return s.Active[i].ID < s.Active[j].ID })
 	for name, t := range d.indexes.Trees {

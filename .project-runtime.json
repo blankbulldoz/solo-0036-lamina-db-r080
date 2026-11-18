@@ -60,6 +60,10 @@
       "command": "python3 examples/walkthrough.py --workflow transaction-close"
     },
     {
+      "workflow_id": "salvage-conflict",
+      "command": "python3 examples/walkthrough.py --workflow salvage-conflict"
+    },
+    {
       "workflow_id": "statistics",
       "command": "python3 examples/walkthrough.py --workflow statistics"
     }
